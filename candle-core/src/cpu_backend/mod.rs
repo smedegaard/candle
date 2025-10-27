@@ -1308,7 +1308,11 @@ impl MatMul {
 impl Map2 for MatMul {
     const OP: &'static str = "mat_mul";
 
-    #[cfg(all(not(feature = "mkl"), not(feature = "accelerate")))]
+    #[cfg(all(
+        not(feature = "mkl"),
+        not(feature = "accelerate"),
+        not(feature = "kleidi")
+    ))]
     fn f<T: 'static + WithDType + num_traits::Num + Copy>(
         &self,
         lhs: &[T],
@@ -1597,6 +1601,92 @@ impl Map2 for MatMul {
             }
             dtype => Err(Error::UnsupportedDTypeForOp(dtype, "matmul").bt())?,
         }
+        Ok(dst)
+    }
+
+    #[cfg(feature = "kleidi")]
+    fn f<T: 'static + WithDType + num_traits::Num + Copy>(
+        &self,
+        lhs: &[T],
+        lhs_l: &Layout,
+        rhs: &[T],
+        rhs_l: &Layout,
+    ) -> Result<Vec<T>> {
+        let (b, m, n, k) = self.0;
+
+        let lhs = &lhs[lhs_l.start_offset()..];
+        let rhs = &rhs[rhs_l.start_offset()..];
+        let (a_skip, b_skip) = self.ab_skip(lhs_l, rhs_l)?;
+        let c_skip: usize = m * n;
+
+        let mut dst = vec![T::zero(); b * m * n];
+
+        match T::DTYPE {
+            DType::F32 => {
+                // Get the NEON 6x16 micro-kernel
+                let ukernel =
+                    kleidiai_rs::ukernels::matmul::matmul_clamp_f32_f32_f32p::neon_mla_6x16();
+
+                // Get kernel parameters
+                let nr = unsafe { (ukernel.get_nr.unwrap())() };
+                let kr = unsafe { (ukernel.get_kr.unwrap())() };
+                let sr = unsafe { (ukernel.get_sr.unwrap())() };
+
+                // Calculate packed RHS size
+                let rhs_packed_size =
+                    kleidiai_rs::ukernels::matmul::pack::kai_rhs_pack_kxn_x32p16x1b_x32_x32_neon::get_rhs_packed_size(n, k);
+
+                for step in 0..b {
+                    let lhs_p = &lhs[step * a_skip..];
+                    let rhs_p = &rhs[step * b_skip..];
+                    let dst_p = &mut dst[step * c_skip..];
+
+                    // Allocate RHS packing buffer
+                    let mut rhs_packed = vec![0u8; rhs_packed_size];
+                    let zero_bias = vec![0.0f32; n]; // Zero bias for 6x16 kernel
+
+                    // Pack RHS matrix
+                    kleidiai_rs::ukernels::matmul::pack::kai_rhs_pack_kxn_x32p16x1b_x32_x32_neon::run(
+                        1,                              // num_groups
+                        n,                              // n
+                        k,                              // k
+                        nr,                             // nr
+                        kr,                             // kr
+                        sr,                             // sr
+                        n * std::mem::size_of::<f32>(), // rhs_stride
+                        rhs_p.as_ptr() as *const core::ffi::c_void,
+                        zero_bias.as_ptr() as *const core::ffi::c_void, // zero bias
+                        std::ptr::null(),               // scale (NULL)
+                        rhs_packed.as_mut_ptr() as *mut core::ffi::c_void,
+                        0,                              // extra_bytes
+                        std::ptr::null(),               // params (NULL)
+                    );
+
+                    // Run the micro-kernel
+                    let lhs_stride = k * std::mem::size_of::<f32>();
+                    let dst_stride_row = n * std::mem::size_of::<f32>();
+                    let dst_stride_col = std::mem::size_of::<f32>();
+
+                    unsafe {
+                        (ukernel.run_matmul.unwrap())(
+                            m,                                               // m
+                            n,                                               // n
+                            k,                                               // k
+                            lhs_p.as_ptr() as *const core::ffi::c_void,      // lhs
+                            lhs_stride,                                      // lhs_stride
+                            rhs_packed.as_ptr() as *const core::ffi::c_void, // rhs_packed
+                            dst_p.as_mut_ptr() as *mut core::ffi::c_void,    // dst
+                            dst_stride_row,                                  // dst_stride_row
+                            dst_stride_col,                                  // dst_stride_col
+                            f32::NEG_INFINITY,                               // scalar_min
+                            f32::INFINITY,                                   // scalar_max
+                        );
+                    }
+                }
+            }
+            dtype => Err(Error::UnsupportedDTypeForOp(dtype, "matmul").bt())?,
+        }
+
         Ok(dst)
     }
 }
