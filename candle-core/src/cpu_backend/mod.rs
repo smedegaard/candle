@@ -1303,6 +1303,175 @@ impl MatMul {
         };
         Ok((a_skip, b_skip))
     }
+
+    #[cfg(feature = "kleidi")]
+    fn prepare_matrices_for_kleidi<T: Copy>(
+        &self,
+        lhs: &[T],
+        lhs_l: &Layout,
+        rhs: &[T],
+        rhs_l: &Layout,
+    ) -> Result<(Vec<T>, Vec<T>, bool, bool)> {
+        let (_, m, n, k) = self.0;
+        let lhs_stride = lhs_l.stride();
+        let rhs_stride = rhs_l.stride();
+
+        let lhs_m1 = lhs_stride[lhs_stride.len() - 1];
+        let lhs_m2 = lhs_stride[lhs_stride.len() - 2];
+        let rhs_m1 = rhs_stride[rhs_stride.len() - 1];
+        let rhs_m2 = rhs_stride[rhs_stride.len() - 2];
+
+        // Determine if LHS needs transformation
+        let (lhs_transformed, lhs_needs_copy) =
+            if (lhs_m1 == 1 || k == 1) && (lhs_m2 == k || m == 1) {
+                // Already row-major, use as-is
+                (lhs.to_vec(), false)
+            } else if lhs_m1 == m && lhs_m2 == 1 {
+                // Column-major, transpose to row-major
+                (self.transpose_matrix(lhs, m, k), true)
+            } else {
+                // Non-contiguous, copy to row-major
+                (self.copy_to_row_major_lhs(lhs, lhs_l, m, k), true)
+            };
+
+        // Determine if RHS needs transformation
+        let (rhs_transformed, rhs_needs_copy) =
+            if (rhs_m1 == 1 || n == 1) && (rhs_m2 == n || k == 1) {
+                // Already row-major, use as-is
+                (rhs.to_vec(), false)
+            } else if rhs_m1 == k && rhs_m2 == 1 {
+                // Column-major, transpose to row-major
+                (self.transpose_matrix(rhs, k, n), true)
+            } else {
+                // Non-contiguous, copy to row-major
+                (self.copy_to_row_major_rhs(rhs, rhs_l, k, n), true)
+            };
+
+        Ok((
+            lhs_transformed,
+            rhs_transformed,
+            lhs_needs_copy,
+            rhs_needs_copy,
+        ))
+    }
+
+    fn transpose_matrix<T: Copy>(&self, matrix: &[T], rows: usize, cols: usize) -> Vec<T> {
+        let mut result = vec![matrix[0]; rows * cols]; // Initialize with first element
+        for i in 0..rows {
+            for j in 0..cols {
+                result[i * cols + j] = matrix[j * rows + i];
+            }
+        }
+        result
+    }
+
+    fn copy_to_row_major_lhs<T: Copy>(
+        &self,
+        lhs: &[T],
+        lhs_l: &Layout,
+        m: usize,
+        k: usize,
+    ) -> Vec<T> {
+        let mut result = vec![lhs[0]; m * k];
+        let lhs_stride = lhs_l.stride();
+        for i in 0..m {
+            for j in 0..k {
+                let src_offset =
+                    i * lhs_stride[lhs_stride.len() - 2] + j * lhs_stride[lhs_stride.len() - 1];
+                result[i * k + j] = lhs[src_offset];
+            }
+        }
+        result
+    }
+
+    fn copy_to_row_major_rhs<T: Copy>(
+        &self,
+        rhs: &[T],
+        rhs_l: &Layout,
+        k: usize,
+        n: usize,
+    ) -> Vec<T> {
+        let mut result = vec![rhs[0]; k * n];
+        let rhs_stride = rhs_l.stride();
+        for i in 0..k {
+            for j in 0..n {
+                let src_offset =
+                    i * rhs_stride[rhs_stride.len() - 2] + j * rhs_stride[rhs_stride.len() - 1];
+                result[i * n + j] = rhs[src_offset];
+            }
+        }
+        result
+    }
+
+    #[cfg(feature = "kleidi")]
+    fn apply_kleidi_kernel_f32(
+        &self,
+        lhs: &[f32],
+        rhs: &[f32],
+        dst: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        use kleidiai_rs::ukernels::matmul::matmul_clamp_f32_f32_f32p;
+        use kleidiai_rs::ukernels::matmul::pack::kai_rhs_pack_kxn_x32p16x1b_x32_x32_neon;
+        use std::ptr;
+
+        // Get the NEON MLA 6x16 micro-kernel
+        let ukernel = matmul_clamp_f32_f32_f32p::neon_mla_6x16();
+
+        // Get kernel parameters
+        let nr = unsafe { (ukernel.get_nr.unwrap())() };
+        let kr = unsafe { (ukernel.get_kr.unwrap())() };
+        let sr = unsafe { (ukernel.get_sr.unwrap())() };
+
+        // Calculate packed RHS size and allocate buffer
+        let rhs_packed_size = kai_rhs_pack_kxn_x32p16x1b_x32_x32_neon::get_rhs_packed_size(n, k);
+        let mut rhs_packed = vec![0u8; rhs_packed_size];
+
+        // Create zero bias (6x16 kernel ignores bias)
+        let bias = vec![0.0f32; n];
+
+        // Pack RHS matrix
+        kai_rhs_pack_kxn_x32p16x1b_x32_x32_neon::run(
+            1,                              // num_groups
+            n,                              // n
+            k,                              // k
+            nr,                             // nr
+            kr,                             // kr
+            sr,                             // sr
+            n * std::mem::size_of::<f32>(), // rhs_stride
+            rhs.as_ptr() as *const std::ffi::c_void,
+            bias.as_ptr() as *const std::ffi::c_void, // zero bias
+            ptr::null(),                              // scale (NULL)
+            rhs_packed.as_mut_ptr() as *mut std::ffi::c_void,
+            0,           // extra_bytes
+            ptr::null(), // params (NULL)
+        );
+
+        // Run the micro-kernel
+        let lhs_stride = k * std::mem::size_of::<f32>();
+        let dst_stride_row = n * std::mem::size_of::<f32>();
+        let dst_stride_col = std::mem::size_of::<f32>();
+
+        unsafe {
+            (ukernel.run_matmul.unwrap())(
+                m,                                              // m
+                n,                                              // n
+                k,                                              // k
+                lhs.as_ptr() as *const std::ffi::c_void,        // lhs
+                lhs_stride,                                     // lhs_stride
+                rhs_packed.as_ptr() as *const std::ffi::c_void, // rhs_packed
+                dst.as_mut_ptr() as *mut std::ffi::c_void,      // dst
+                dst_stride_row,                                 // dst_stride_row
+                dst_stride_col,                                 // dst_stride_col
+                f32::NEG_INFINITY,                              // scalar_min
+                f32::INFINITY,                                  // scalar_max
+            );
+        }
+
+        Ok(())
+    }
 }
 
 impl Map2 for MatMul {
@@ -1613,81 +1782,103 @@ impl Map2 for MatMul {
         rhs_l: &Layout,
     ) -> Result<Vec<T>> {
         let (b, m, n, k) = self.0;
-
         let lhs = &lhs[lhs_l.start_offset()..];
         let rhs = &rhs[rhs_l.start_offset()..];
-        let (a_skip, b_skip) = self.ab_skip(lhs_l, rhs_l)?;
-        let c_skip: usize = m * n;
 
-        let mut dst = vec![T::zero(); b * m * n];
-
+        // Check data type support
         match T::DTYPE {
             DType::F32 => {
-                // Get the NEON 6x16 micro-kernel
-                let ukernel =
-                    kleidiai_rs::ukernels::matmul::matmul_clamp_f32_f32_f32p::neon_mla_6x16();
+                // Transform matrices to fit KleidiAI expectations
+                let (lhs_prepared, rhs_prepared, lhs_transformed, rhs_transformed) =
+                    self.prepare_matrices_for_kleidi(lhs, lhs_l, rhs, rhs_l)?;
 
-                // Get kernel parameters
-                let nr = unsafe { (ukernel.get_nr.unwrap())() };
-                let kr = unsafe { (ukernel.get_kr.unwrap())() };
-                let sr = unsafe { (ukernel.get_sr.unwrap())() };
+                if lhs_transformed || rhs_transformed {
+                    eprintln!(
+                        "KleidiAI matrix layout transformation applied:\n\
+                         - LHS matrix transformed: {}\n\
+                         - RHS matrix transformed: {}\n\
+                         - Original LHS stride: {:?}\n\
+                         - Original RHS stride: {:?}",
+                        lhs_transformed,
+                        rhs_transformed,
+                        lhs_l.stride(),
+                        rhs_l.stride()
+                    );
+                }
 
-                // Calculate packed RHS size
-                let rhs_packed_size =
-                    kleidiai_rs::ukernels::matmul::pack::kai_rhs_pack_kxn_x32p16x1b_x32_x32_neon::get_rhs_packed_size(n, k);
+                let mut dst = vec![T::zero(); b * m * n];
 
                 for step in 0..b {
-                    let lhs_p = &lhs[step * a_skip..];
-                    let rhs_p = &rhs[step * b_skip..];
-                    let dst_p = &mut dst[step * c_skip..];
+                    // Use prepared matrices (now guaranteed to be row-major)
+                    let lhs_offset = step * m * k;
+                    let rhs_offset = step * k * n;
+                    let dst_offset = step * m * n;
 
-                    // Allocate RHS packing buffer
-                    let mut rhs_packed = vec![0u8; rhs_packed_size];
-                    let zero_bias = vec![0.0f32; n]; // Zero bias for 6x16 kernel
+                    let lhs_p = &lhs_prepared[lhs_offset..lhs_offset + m * k];
+                    let rhs_p = &rhs_prepared[rhs_offset..rhs_offset + k * n];
+                    let dst_p = &mut dst[dst_offset..dst_offset + m * n];
 
-                    // Pack RHS matrix
-                    kleidiai_rs::ukernels::matmul::pack::kai_rhs_pack_kxn_x32p16x1b_x32_x32_neon::run(
-                        1,                              // num_groups
-                        n,                              // n
-                        k,                              // k
-                        nr,                             // nr
-                        kr,                             // kr
-                        sr,                             // sr
-                        n * std::mem::size_of::<f32>(), // rhs_stride
-                        rhs_p.as_ptr() as *const core::ffi::c_void,
-                        zero_bias.as_ptr() as *const core::ffi::c_void, // zero bias
-                        std::ptr::null(),               // scale (NULL)
-                        rhs_packed.as_mut_ptr() as *mut core::ffi::c_void,
-                        0,                              // extra_bytes
-                        std::ptr::null(),               // params (NULL)
-                    );
+                    // Cast to f32 slices for KleidiAI kernel
+                    let lhs_f32 =
+                        unsafe { std::slice::from_raw_parts(lhs_p.as_ptr() as *const f32, m * k) };
+                    let rhs_f32 =
+                        unsafe { std::slice::from_raw_parts(rhs_p.as_ptr() as *const f32, k * n) };
+                    let dst_f32 = unsafe {
+                        std::slice::from_raw_parts_mut(dst_p.as_mut_ptr() as *mut f32, m * n)
+                    };
 
-                    // Run the micro-kernel
-                    let lhs_stride = k * std::mem::size_of::<f32>();
-                    let dst_stride_row = n * std::mem::size_of::<f32>();
-                    let dst_stride_col = std::mem::size_of::<f32>();
-
-                    unsafe {
-                        (ukernel.run_matmul.unwrap())(
-                            m,                                               // m
-                            n,                                               // n
-                            k,                                               // k
-                            lhs_p.as_ptr() as *const core::ffi::c_void,      // lhs
-                            lhs_stride,                                      // lhs_stride
-                            rhs_packed.as_ptr() as *const core::ffi::c_void, // rhs_packed
-                            dst_p.as_mut_ptr() as *mut core::ffi::c_void,    // dst
-                            dst_stride_row,                                  // dst_stride_row
-                            dst_stride_col,                                  // dst_stride_col
-                            f32::NEG_INFINITY,                               // scalar_min
-                            f32::INFINITY,                                   // scalar_max
+                    // Apply KleidiAI kernel
+                    if let Err(e) = self.apply_kleidi_kernel_f32(lhs_f32, rhs_f32, dst_f32, m, n, k)
+                    {
+                        panic!(
+                            "KleidiAI kernel execution failed:\n\
+                             - Error: {}\n\
+                             - Matrix dimensions: {}×{}×{}\n\
+                             - Batch step: {}/{}\n\
+                             - This indicates a problem with the kernel invocation or parameters",
+                            e,
+                            m,
+                            n,
+                            k,
+                            step + 1,
+                            b
                         );
                     }
                 }
-            }
-            dtype => Err(Error::UnsupportedDTypeForOp(dtype, "matmul").bt())?,
-        }
 
-        Ok(dst)
+                Ok(dst)
+            }
+            DType::F16 => {
+                panic!(
+                    "KleidiAI kernel does not support F16 data type in this proof of concept:\n\
+                     - Requested type: F16\n\
+                     - Supported types: F32 only\n\
+                     - Matrix dimensions: {}×{}×{}\n\
+                     - Note: F16 kernels are available in KleidiAI but not implemented in this PoC",
+                    m, n, k
+                );
+            }
+            DType::F64 => {
+                panic!(
+                    "KleidiAI kernel does not support F64 data type:\n\
+                     - Requested type: F64\n\
+                     - Supported types: F32 only\n\
+                     - Matrix dimensions: {}×{}×{}\n\
+                     - Recommendation: Use F32 matrices for KleidiAI acceleration",
+                    m, n, k
+                );
+            }
+            dtype => {
+                panic!(
+                    "KleidiAI kernel does not support {:?} data type:\n\
+                     - Requested type: {:?}\n\
+                     - Supported types: F32 only\n\
+                     - Matrix dimensions: {}×{}×{}\n\
+                     - Recommendation: Use F32 matrices for KleidiAI acceleration",
+                    dtype, dtype, m, n, k
+                );
+            }
+        }
     }
 }
 
